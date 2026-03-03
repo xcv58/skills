@@ -7,6 +7,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -46,6 +47,33 @@ def _as_dict(value: Any, name: str) -> Dict[str, Any]:
     return value
 
 
+def _predict_with_retry(
+    client: Client,
+    *args: Any,
+    api_name: str,
+    max_retries: int,
+    retry_backoff: float,
+    operation_name: str,
+) -> Any:
+    attempts = max(1, max_retries + 1)
+    delay_base = max(0.0, retry_backoff)
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.predict(*args, api_name=api_name)
+        except Exception as exc:
+            if attempt >= attempts:
+                raise RuntimeError(
+                    f"{operation_name} failed after {attempts} attempt(s): {exc}"
+                ) from exc
+            sleep_s = delay_base * (2 ** (attempt - 1))
+            print(
+                f"{operation_name} attempt {attempt}/{attempts} failed: {exc}. "
+                f"Retrying in {sleep_s:.1f}s...",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_s)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Transcribe a media file and AI-correct the generated SRT."
@@ -67,6 +95,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Set return_traditional=True for /srt_correct.",
     )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=600.0,
+        help="HTTP request timeout (seconds) for each API call.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Retry count for transient API errors (total attempts = max_retries + 1).",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=2.0,
+        help="Initial backoff seconds for retries (exponential).",
+    )
+    parser.add_argument(
+        "--save-raw-on-correction-failure",
+        action="store_true",
+        help="Write transcribed SRT if correction fails instead of exiting with error.",
+    )
     return parser.parse_args()
 
 
@@ -80,11 +131,22 @@ def main() -> int:
         return 2
 
     token = _resolve_cf_access_token(args.api_url, args.cf_access_token)
-    client = Client(args.api_url, headers={"CF-Access-Token": token})
+    httpx_kwargs: Dict[str, Any] = {}
+    if args.request_timeout and args.request_timeout > 0:
+        httpx_kwargs["timeout"] = args.request_timeout
+    client = Client(
+        args.api_url,
+        headers={"CF-Access-Token": token},
+        httpx_kwargs=httpx_kwargs or None,
+    )
 
-    transcribe_res = client.predict(
+    transcribe_res = _predict_with_retry(
+        client,
         handle_file(str(input_media)),
         api_name="/transcribe",
+        max_retries=args.max_retries,
+        retry_backoff=args.retry_backoff,
+        operation_name="/transcribe",
     )
     transcribe_res = _as_dict(transcribe_res, "/transcribe")
     print("transcribe status:", transcribe_res.get("status", ""))
@@ -93,15 +155,34 @@ def main() -> int:
     if not isinstance(srt_text, str) or not srt_text.strip():
         raise RuntimeError("/transcribe returned empty srt_content.")
 
-    correct_res = client.predict(
-        srt_text,
-        args.api_key,
-        args.model_name,
-        args.custom_model,
-        args.base_url,
-        bool(args.return_traditional),
-        api_name="/srt_correct",
-    )
+    try:
+        correct_res = _predict_with_retry(
+            client,
+            srt_text,
+            args.api_key,
+            args.model_name,
+            args.custom_model,
+            args.base_url,
+            bool(args.return_traditional),
+            api_name="/srt_correct",
+            max_retries=args.max_retries,
+            retry_backoff=args.retry_backoff,
+            operation_name="/srt_correct",
+        )
+    except Exception:
+        if not args.save_raw_on_correction_failure:
+            raise
+
+        output_srt.parent.mkdir(parents=True, exist_ok=True)
+        output_srt.write_text(srt_text, encoding="utf-8")
+        print(
+            "warning: /srt_correct failed; wrote raw transcription SRT because "
+            "--save-raw-on-correction-failure is enabled.",
+            file=sys.stderr,
+        )
+        print(f"wrote: {output_srt}")
+        return 0
+
     correct_res = _as_dict(correct_res, "/srt_correct")
     print("correct status:", correct_res.get("status", ""))
 

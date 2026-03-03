@@ -64,11 +64,15 @@ final_srt = correct_res.get("corrected_srt") or srt_text
 
 Chinese SRT -> Traditional -> AI correction:
 ```python
-# 3) Translate to Traditional text using wrapper endpoint
-original_srt, translated_srt, download_path, status = client.predict(
+# 3) Translate to Traditional text (JSON endpoint)
+trad_res = client.predict(
     [handle_file("/absolute/path/a.srt")],
-    api_name="/safe_translate_traditional_wrapper",
+    api_name="/srt_translate_traditional_text",
 )
+status = trad_res.get("status", "")
+translated_srt = trad_res.get("translated_srt", "")
+if not translated_srt and trad_res.get("items"):
+    translated_srt = trad_res["items"][0].get("translated_srt", "")
 print("traditional status:", status)
 
 # 4) AI correction on translated text
@@ -85,12 +89,34 @@ print("correct status:", correct_res.get("status"))
 final_srt = correct_res.get("corrected_srt") or translated_srt
 ```
 
+Async submit + poll (long-running):
+```python
+# Submit a long job
+submit_res = client.predict(
+    handle_file("/absolute/path/input.mp3"),
+    "",              # api_key
+    "gpt-4o-mini",   # model_name
+    "",              # custom_model
+    "",              # base_url
+    True,            # return_traditional
+    api_name="/submit_transcribe_and_correct",
+)
+job_id = submit_res["job_id"]
+
+# Poll until completed/failed
+while True:
+    status_res = client.predict(job_id, True, api_name="/async_job_status")
+    print(status_res["status"], status_res.get("stage"), status_res.get("eta_seconds"))
+    if status_res["status"] in {"completed", "failed"}:
+        break
+```
+
 Notes:
 - `/srt_translate_traditional` may return preview/download metadata rather than direct translated text.
 - `corrected_traditional_file_path` may point to a server-local path and not be directly readable.
 
 Run reusable scripts:
 ```shell
-python scripts/transcribe_and_correct.py /abs/in.mp3 /abs/out.srt
-python scripts/to_traditional_and_correct.py /abs/in.srt /abs/out_traditional.srt
+python scripts/transcribe_and_correct.py /abs/in.mp3 /abs/out.srt --request-timeout 600 --max-retries 2
+python scripts/to_traditional_and_correct.py /abs/in.srt /abs/out_traditional.srt --request-timeout 600 --max-retries 2
 ```
